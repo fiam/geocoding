@@ -28,15 +28,13 @@ from django.utils.translation import ugettext as _
 from geonames.models import Geoname, Country
 
 from datetime import datetime
-from xml.etree.cElementTree import iterparse
 from urllib2 import urlopen, quote
 from decimal import Decimal, InvalidOperation
 
 GOOGLE_GEOCODE_URI = 'http://maps.google.com/maps/geo?key=%(key)s&' \
-        'oe=utf8&output=xml&q=%(q)s'
-GOOGLE_REVERSE_GEOCODE_URI = 'http://maps.google.com/maps/nav?key=%(key)s&' \
-        'oe=utf8&q=from%%3A%%20%(latitude)s%%2C%(longitude)s%%20to%%3A%%20' \
-        '%(latitude)s%%2C%(longitude)s'
+        'oe=utf8&output=json&q=%(q)s'
+GOOGLE_REVERSE_GEOCODE_URI = 'http://maps.google.com/maps/geo?output=json' \
+        '&oe=utf-8&ll=%(latitude)s%%2C%(longitude)s&key=%(key)s'
 
 class BigIntegerField(models.IntegerField):
     empty_strings_allowed = False
@@ -103,6 +101,29 @@ class GeocodedPoint(models.Model):
         self.save()
         return self
 
+    def read_data(self, data):
+        if data['Status']['code'] == 200 and 'Placemark' in data \
+                and len(data['Placemark']) > 0:
+
+            self.address = data['Placemark'][0]['address']
+            self.country_id = data['Placemark'][0]['AddressDetails']['Country']['CountryNameCode']
+            self.accuracy = data['Placemark'][0]['AddressDetails']['Accuracy']
+            self.longitude, self.latitude, self.altitude = [Decimal(str(x)) for x in data['Placemark'][0]['Point']['coordinates']]
+
+            try:
+                locality = data['Placemark'][0]['AddressDetails']['Country']['AdministrativeArea']['SubAdministrativeArea']['Locality']
+            except KeyError:
+                # No more interesting data
+                self.save()
+                return
+
+            self.locality_name = locality.get('LocalityName')
+            self.dependent_locality_name = locality.get('DependentLocalityName')
+            if 'Thoroughfare' in locality:
+                self.thoroughfare_name = locality['Thoroughfare'].get('ThoroughfareName')
+
+            self.save()
+
     @property
     def near_name(self):
         try:
@@ -164,37 +185,18 @@ def direct_geocode(address):
 
     fp = urlopen(GOOGLE_GEOCODE_URI % { 'key': settings.GOOGLE_JS_API_KEY,
             'q': quote(address.encode('utf8')) })
-    for event, element in iterparse(fp):
-        if element.tag == '{http://earth.google.com/kml/2.0}code':
-            point.status = int(element.text)
-            if point.status != 200:
-                break
-        elif element.tag == '{http://earth.google.com/kml/2.0}address':
-            point.address = element.text
-        elif element.tag == '{urn:oasis:names:tc:ciq:xsdschema:' \
-                'xAL:2.0}CountryNameCode':
-            point.country_id = element.text 
-        elif element.tag == '{urn:oasis:names:tc:ciq:xsdschema:' \
-                'xAL:2.0}LocalityName':
-            point.locality_name = element.text
-        elif element.tag == '{urn:oasis:names:tc:ciq:xsdschema:' \
-                'xAL:2.0}DependentLocalityName':
-            point.dependent_locality_name = element.text
-        elif element.tag == '{urn:oasis:names:tc:ciq:xsdschema:' \
-                'xAL:2.0}ThoroughfareName':
-            point.thoroughfare_name = element.text
-        elif element.tag == '{urn:oasis:names:tc:ciq:xsdschema:' \
-                'xAL:2.0}AddressDetails':
-            point.accuracy = int(element.attrib['Accuracy'])
-        elif element.tag == '{http://earth.google.com/kml/2.0}coordinates':
-            point.longitude, point.latitude, point.altitude = \
-                [Decimal(x) for x in element.text.split(',')]
+
+    data = simplejson.load(fp)
+    fp.close()
+
+    point.read_data(data)
 
     return point.match()
 
 def reverse_geocode(latitude, longitude):
     if not (-85 < latitude < 85) or not (-180 < longitude < 180):
         return GeocodedPoint(status=400)
+
     h = hash('%s,%s' % (latitude, longitude))
     point, created = GeocodedPoint.objects.get_or_create(hash=h)
     if not created:
@@ -203,6 +205,7 @@ def reverse_geocode(latitude, longitude):
     fp = urlopen(GOOGLE_REVERSE_GEOCODE_URI % { 'key': settings.GOOGLE_JS_API_KEY, 'latitude': latitude, 'longitude': longitude })
     data = simplejson.load(fp)
     fp.close()
+
     point.status = data['Status']['code']
     if point.status != 200:
         if point.status == 604:
@@ -210,14 +213,9 @@ def reverse_geocode(latitude, longitude):
         point.latitude, point.longitude = [Decimal(str(x)) for x in (latitude, longitude)]
         return point.match()
     
-    point.address = data['Placemark'][0]['address']
-    point.accuracy = data['Placemark'][0]['AddressDetails']['Accuracy']
-    point.thoroughfare_name = data['Placemark'][0]['AddressDetails']['Thoroughfare']['ThoroughfareName']
-    if point.thoroughfare_name == 'Unknown road':
-        point.thoroughfare_name = None
+    point.read_data(data)
+    # Override coordinates with the ones passed to this function
     point.latitude, point.longitude = [Decimal(str(x)) for x in (latitude, longitude)]
-    point.altitude = Decimal(str(data['Placemark'][0]['Point']['coordinates'][2]))
-    #point.longitude, point.latitude, point.altitude = [Decimal(str(x)) for x in data['Placemark'][0]['Point']['coordinates']]
 
     return point.match()
 
